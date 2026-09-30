@@ -8,17 +8,17 @@
 - 시가총액 및 (평균거래량 / 상장주식수) 회전율
 
 필요 패키지:
-    pip install streamlit yfinance pandas plotly openpyxl requests lxml
+    pip install streamlit yfinance pandas plotly openpyxl requests lxml finance-datareader
 
 실행 방법:
     streamlit run app.py
 
-※ 전종목(코스피/코스닥) 목록은 FinanceDataReader 대신
-   KRX 기업공시채널(KIND)의 "상장법인목록" 다운로드 페이지에서 직접 가져옵니다.
-   (data.krx.co.kr 이 아니라 kind.krx.co.kr 이라 별도 로그인이 필요 없습니다)
+※ 전종목 목록: 1순위 KIND(기업공시채널), 실패 시 FinanceDataReader
+※ 시가총액/상장주식수: 1순위 FinanceDataReader 목록 값, 없으면 야후파이낸스(fast_info → get_info) 순서로 시도
 """
 
 import io
+import math
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -42,6 +42,8 @@ PERIOD_OPTIONS = {
     "2년": "2y",
 }
 
+LISTING_COLS = ["종목명", "종목코드", "시장구분", "시가총액", "상장주식수"]
+
 
 # ────────────────────────────────────────────────────────
 # 데이터 로딩 (캐시)
@@ -50,7 +52,7 @@ KIND_URL = "https://kind.krx.co.kr/corpgeneral/corpList.do"
 
 
 def _fetch_kind_market(market_type: str) -> pd.DataFrame:
-    """KIND(기업공시채널) 상장법인목록 다운로드 - 로그인 불필요, FinanceDataReader 미사용"""
+    """KIND(기업공시채널) 상장법인목록 다운로드 - 로그인 불필요"""
     params = {
         "method": "download",
         "searchType": "13",
@@ -58,21 +60,61 @@ def _fetch_kind_market(market_type: str) -> pd.DataFrame:
     }
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        # Referer 없이 직접 호출하면 봇 차단(403)에 걸리는 경우가 있어 추가
         "Referer": "https://kind.krx.co.kr/corpgeneral/corpList.do?method=loadInitPage",
     }
     resp = requests.get(KIND_URL, params=params, headers=headers, timeout=15)
     resp.raise_for_status()
-    resp.encoding = "euc-kr"  # KIND 페이지 기본 인코딩
+    resp.encoding = "euc-kr"
 
     tables = pd.read_html(io.StringIO(resp.text))
     df = tables[0]
     df["종목코드"] = df["종목코드"].astype(str).str.zfill(6)
-    return df[["회사명", "종목코드"]].rename(columns={"회사명": "종목명"})
+    df = df[["회사명", "종목코드"]].rename(columns={"회사명": "종목명"})
+
+    # KIND 목록에는 시가총액/상장주식수가 없으므로 빈 값으로 둠 (나중에 야후로 채움)
+    df["시가총액"] = float("nan")
+    df["상장주식수"] = float("nan")
+    return df
+
+
+def _normalize_market(value) -> str | None:
+    """FinanceDataReader의 시장 표기를 KOSPI / KOSDAQ 으로 통일"""
+    v = str(value).upper()
+    if v in ("KOSPI", "STK"):
+        return "KOSPI"
+    if v.startswith("KOSDAQ") or v == "KSQ":  # 'KOSDAQ GLOBAL' 포함
+        return "KOSDAQ"
+    return None  # KONEX 등은 제외
+
+
+def _fetch_fdr_listing() -> pd.DataFrame:
+    """FinanceDataReader 전종목 목록 (시가총액 Marcap, 상장주식수 Stocks 포함)"""
+    import FinanceDataReader as fdr
+
+    try:
+        fdr_df = fdr.StockListing("KRX")
+    except Exception:
+        fdr_df = pd.concat(
+            [fdr.StockListing("KOSPI"), fdr.StockListing("KOSDAQ")], ignore_index=True
+        )
+
+    code_col = "Code" if "Code" in fdr_df.columns else "Symbol"
+    market_col = "Market" if "Market" in fdr_df.columns else "MarketId"
+
+    out = pd.DataFrame()
+    out["종목명"] = fdr_df["Name"]
+    out["종목코드"] = fdr_df[code_col].astype(str).str.zfill(6)
+    out["시장구분"] = fdr_df[market_col].map(_normalize_market)
+
+    # 시가총액(원), 상장주식수 - 컬럼이 없거나 비어 있으면 NaN
+    out["시가총액"] = pd.to_numeric(fdr_df.get("Marcap"), errors="coerce") if "Marcap" in fdr_df.columns else float("nan")
+    out["상장주식수"] = pd.to_numeric(fdr_df.get("Stocks"), errors="coerce") if "Stocks" in fdr_df.columns else float("nan")
+
+    return out.dropna(subset=["시장구분"])
 
 
 def _fetch_krx_listing():
-    """1순위: KIND(기업공시채널) 다운로드. 실패 시 2순위로 FinanceDataReader가 설치되어 있으면 그걸로 폴백."""
+    """1순위: KIND. 실패 시 2순위: FinanceDataReader."""
     errors = []
 
     try:
@@ -80,30 +122,14 @@ def _fetch_krx_listing():
         kospi["시장구분"] = "KOSPI"
         kosdaq = _fetch_kind_market("kosdaqMkt")
         kosdaq["시장구분"] = "KOSDAQ"
-        return pd.concat([kospi, kosdaq], ignore_index=True)
+        return pd.concat([kospi, kosdaq], ignore_index=True)[LISTING_COLS]
     except Exception as e:
         errors.append(f"KIND 상장법인목록 조회 실패: {e}")
 
-    # 폴백: finance-datareader가 설치돼 있으면 시도 (없으면 조용히 건너뜀)
     try:
-        import FinanceDataReader as fdr
-
-        try:
-            fdr_df = fdr.StockListing("KRX")
-        except Exception:
-            kospi_fdr = fdr.StockListing("KOSPI")
-            kosdaq_fdr = fdr.StockListing("KOSDAQ")
-            fdr_df = pd.concat([kospi_fdr, kosdaq_fdr], ignore_index=True)
-
-        code_col = "Code" if "Code" in fdr_df.columns else "Symbol"
-        market_col = "Market" if "Market" in fdr_df.columns else "MarketId"
-        fdr_df = fdr_df[fdr_df[market_col].isin(["KOSPI", "KOSDAQ"])].copy()
-        fdr_df["종목코드"] = fdr_df[code_col].astype(str).str.zfill(6)
-        fdr_df["종목명"] = fdr_df["Name"]
-        fdr_df["시장구분"] = fdr_df[market_col]
-        return fdr_df[["종목명", "종목코드", "시장구분"]]
+        return _fetch_fdr_listing()[LISTING_COLS]
     except ImportError:
-        pass
+        errors.append("FinanceDataReader 미설치 (requirements.txt에 finance-datareader 추가 필요)")
     except Exception as e:
         errors.append(f"FinanceDataReader 폴백도 실패: {e}")
 
@@ -123,25 +149,75 @@ def load_ticker_list():
         lambda r: r["종목코드"] + (".KS" if r["시장구분"] == "KOSPI" else ".KQ"), axis=1
     )
 
-    return df[["종목명", "종목코드", "시장구분", "야후심볼"]].reset_index(drop=True)
+    return df[LISTING_COLS + ["야후심볼"]].reset_index(drop=True)
+
+
+def _valid(x) -> bool:
+    """None, NaN, 0 이 아닌 숫자인지 확인"""
+    try:
+        return x is not None and not math.isnan(float(x)) and float(x) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 @st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
-def get_market_cap_info(symbol: str, last_price: float):
-    """선택한 종목 하나에 대해서만 야후파이낸스로 시가총액/상장주식수 추정 (best-effort)"""
+def get_yahoo_cap_info(symbol: str):
+    """야후파이낸스에서 시가총액/상장주식수 조회. fast_info 먼저, 안 되면 get_info."""
+    market_cap, shares = None, None
+
+    # 1) fast_info : 가볍고 빠르며 클라우드 환경에서도 비교적 잘 동작
     try:
-        info = yf.Ticker(symbol).get_info()
+        fi = yf.Ticker(symbol).fast_info
+        shares = fi.get("shares") if hasattr(fi, "get") else getattr(fi, "shares", None)
+        market_cap = fi.get("market_cap") if hasattr(fi, "get") else getattr(fi, "market_cap", None)
     except Exception:
-        return None, None
+        pass
 
-    shares = info.get("sharesOutstanding")
-    market_cap = info.get("marketCap")
+    # 2) get_info : 무겁고 가끔 막히지만 정보가 더 많음
+    if not (_valid(market_cap) and _valid(shares)):
+        try:
+            info = yf.Ticker(symbol).get_info()
+            if not _valid(shares):
+                shares = info.get("sharesOutstanding")
+            if not _valid(market_cap):
+                market_cap = info.get("marketCap")
+        except Exception:
+            pass
 
+    return (
+        float(market_cap) if _valid(market_cap) else None,
+        float(shares) if _valid(shares) else None,
+    )
+
+
+def get_market_cap_info(symbol: str, last_price: float, listing_cap, listing_shares):
+    """
+    시가총액(억원), 상장주식수, 출처를 반환.
+    1순위: 전종목 목록(FinanceDataReader)에 들어있는 값
+    2순위: 야후파이낸스
+    둘 중 하나만 있으면 '주식수 x 종가' 로 시가총액을 계산.
+    """
+    market_cap = float(listing_cap) if _valid(listing_cap) else None
+    shares = float(listing_shares) if _valid(listing_shares) else None
+    source = "KRX 목록(FinanceDataReader)" if (market_cap or shares) else None
+
+    if market_cap is None or shares is None:
+        y_cap, y_shares = get_yahoo_cap_info(symbol)
+        if market_cap is None and y_cap:
+            market_cap = y_cap
+        if shares is None and y_shares:
+            shares = y_shares
+        if (y_cap or y_shares) and source is None:
+            source = "야후파이낸스"
+        elif (y_cap or y_shares) and source:
+            source += " + 야후파이낸스"
+
+    # 시가총액이 없고 주식수만 있으면 직접 계산
     if market_cap is None and shares:
         market_cap = shares * last_price
 
     marcap_eok = round(market_cap / 1e8, 1) if market_cap else None
-    return marcap_eok, shares
+    return marcap_eok, shares, source
 
 
 @st.cache_data(ttl=60 * 30, show_spinner="시세 데이터 가져오는 중...")
@@ -197,7 +273,10 @@ if query:
 
 chart_period_label = st.sidebar.selectbox("차트 조회 기간", list(PERIOD_OPTIONS.keys()), index=2)
 
-st.sidebar.caption("※ 종목 목록은 KRX 기업공시채널(KIND) 기준, 시세·거래량·시가총액은 야후파이낸스 기준입니다.")
+st.sidebar.caption(
+    "※ 종목 목록은 KIND 또는 FinanceDataReader 기준, 시세·거래량은 야후파이낸스 기준입니다. "
+    "시가총액은 FinanceDataReader 값을 우선 사용하고, 없으면 야후파이낸스 값을 사용합니다."
+)
 
 
 # ────────────────────────────────────────────────────────
@@ -224,13 +303,21 @@ if hist_full is None or hist_3mo is None:
 hist_full = hist_full.sort_index()
 hist_3mo = hist_3mo.sort_index()
 
-last_price = hist_full["Close"].iloc[-1]
+last_price = float(hist_full["Close"].iloc[-1])
 last_date = hist_full.index[-1].strftime("%Y-%m-%d")
 
-marcap_eok, shares_out = get_market_cap_info(symbol, last_price)
+marcap_eok, shares_out, cap_source = get_market_cap_info(
+    symbol,
+    last_price,
+    selected_row.get("시가총액"),
+    selected_row.get("상장주식수"),
+)
 
 st.subheader(f"{name} ({code}) · {market}")
-st.caption(f"기준일: {last_date} · 야후심볼: {symbol}")
+caption = f"기준일: {last_date} · 야후심볼: {symbol}"
+if cap_source:
+    caption += f" · 시가총액 출처: {cap_source}"
+st.caption(caption)
 
 # ── 상단 요약 지표 ──
 col1, col2, col3, col4 = st.columns(4)
@@ -263,6 +350,9 @@ for label, n_days in WINDOWS.items():
 
 summary_df = pd.DataFrame(summary_rows)
 st.dataframe(summary_df, hide_index=True, use_container_width=True)
+
+if shares_out is None:
+    st.caption("※ 상장주식수 정보를 찾지 못해 회전율을 계산하지 못했습니다.")
 
 # ── 일별 그래프 (종가 + 거래량) ──
 st.markdown(f"### 일별 종가 · 거래량 ({chart_period_label})")
